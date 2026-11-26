@@ -1,0 +1,6 @@
+# Ganti api.example.com dengan domain API-mu,
+# dan arahkan A record domain tersebut ke IP VPS.
+# Caddy otomatis mengurus sertifikat HTTPS (Let's Encrypt).
+api.example.com {
+	reverse_proxy api:3000
+}

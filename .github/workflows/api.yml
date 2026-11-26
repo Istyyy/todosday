@@ -1,0 +1,134 @@
+name: API CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/api/**'
+      - 'packages/shared/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/api.yml'
+  pull_request:
+    paths:
+      - 'apps/api/**'
+      - 'packages/shared/**'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/api.yml'
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  ci:
+    name: Lint, test & build
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://todosday:todosday@localhost:5432/todosday_test
+      JWT_SECRET: jwt-secret-untuk-testing-jangan-dipakai-produksi
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: todosday
+          POSTGRES_PASSWORD: todosday
+          POSTGRES_DB: todosday_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U todosday"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Versi pnpm dibaca otomatis dari field "packageManager" di package.json
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared package
+        run: pnpm --filter @todosday/shared build
+
+      - name: Lint
+        run: pnpm --filter @todosday/api lint
+
+      - name: Unit test
+        run: pnpm --filter @todosday/api test
+
+      - name: Jalankan migrasi (untuk e2e)
+        run: pnpm --filter @todosday/api exec prisma migrate deploy
+
+      - name: E2E test
+        run: pnpm --filter @todosday/api test:e2e
+
+      - name: Build
+        run: pnpm --filter @todosday/api build
+
+  build-and-push:
+    name: Build & push image Docker
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR mensyaratkan nama image huruf kecil
+      - name: Nama image (lowercase)
+        id: image
+        run: echo "name=${OWNER,,}/todosday-api" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ github.repository_owner }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy ke VPS
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-api
+      cancel-in-progress: false
+    permissions:
+      packages: read
+    steps:
+      - name: Deploy lewat SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd /srv/todosday
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+            IMAGE_TAG=${{ github.sha }} docker compose pull api
+            IMAGE_TAG=${{ github.sha }} docker compose run --rm api ./node_modules/.bin/prisma migrate deploy
+            IMAGE_TAG=${{ github.sha }} docker compose up -d
+            docker image prune -f

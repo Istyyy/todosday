@@ -1,0 +1,11 @@
+.git
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+coverage
+.github
+apps/web
+**/.env
+**/.env.local
